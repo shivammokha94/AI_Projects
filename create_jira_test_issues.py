@@ -1,212 +1,231 @@
 #!/usr/bin/env python3
-"""Create test Jira issues across one or more projects via Atlassian Cloud REST API.
+"""Create test Jira issues across one or more projects with varied generated data.
 
-Usage:
-  python create_jira_test_issues.py \
+Auth (token MUST come from the env var so it stays out of shell history and ps output):
+  export JIRA_API_TOKEN='...'
+  python3 create_jira_test_issues.py \
     --site shivammokha94.atlassian.net \
-    --user your-email@example.com \
-    --token YOUR_API_TOKEN \
-    --count 50
+    --user you@example.com
 
-By default this creates --count issues in each of:
+By default creates --count issues in each of:
   Delivery, Feature Tracking, Change Request, Product Delivery
 
-Override with --projects (names or keys, space-separated):
-  --projects DEL "Feature Tracking" CR PD
-
-Environment variables (used if matching CLI flag is omitted):
-  JIRA_SITE, JIRA_USER, JIRA_API_TOKEN, ISSUE_COUNT
+Each issue gets a randomly composed summary, a multi-paragraph ADF description,
+a random priority, a random set of labels (always including 'auto-test'), and
+optionally a random issue type. After creation the script adds 1:N / N:N / N:1
+issue links and randomly transitions a configurable fraction to In Progress / Done.
 """
 
 import argparse
 import json
-import os
 import random
 import sys
 
-try:
-    import requests
-except ImportError:
-    print("The 'requests' package is required. Install it with: pip install requests")
-    sys.exit(1)
+from jira_common import (
+    build_session,
+    confirm_or_exit,
+    get_env_or_arg,
+    request_with_retry,
+    resolve_project_key,
+    transition_issue,
+    truncate,
+    validate_site,
+)
+
 
 DEFAULT_PROJECTS = ['Delivery', 'Feature Tracking', 'Change Request', 'Product Delivery']
-ISSUE_TYPES = ['Task', 'Story', 'Bug', 'Improvement', 'Epic', 'Spike']
+SAFE_ISSUE_TYPES = ['Task', 'Story', 'Bug']
 PRIORITIES = ['Highest', 'High', 'Medium', 'Low', 'Lowest']
 
+ACTION_VERBS = [
+    'Implement', 'Refactor', 'Investigate', 'Document', 'Optimize',
+    'Migrate', 'Add', 'Remove', 'Update', 'Fix', 'Review', 'Profile',
+    'Audit', 'Replace', 'Consolidate', 'Extract', 'Harden', 'Re-test',
+    'Roll out', 'Deprecate',
+]
+COMPONENTS = [
+    'authentication flow', 'payment gateway', 'dashboard widget',
+    'user onboarding', 'search index', 'notification service',
+    'reporting pipeline', 'admin panel', 'API rate limiter',
+    'session store', 'background job runner', 'email templates',
+    'webhook handler', 'CSV export', 'audit log', 'feature flag system',
+    'caching layer', 'permission model', 'analytics tracker',
+    'invoice generator', 'image upload service', 'OAuth integration',
+    'metrics exporter', 'release pipeline',
+]
+QUALIFIERS = [
+    'for the mobile clients', 'on the staging cluster',
+    'before the next release', 'as part of Q3 cleanup',
+    'per the latest RFC', '(blocking release)', 'for accessibility audit',
+    'after the recent migration', 'flagged by oncall',
+]
+DESCRIPTION_TEMPLATES = [
+    "Customer reports indicate that {component} occasionally times out under sustained load. "
+    "Reproduce with the load test harness and capture flamegraph data.",
+    "Stakeholders requested {component} be aligned with the new design system. "
+    "Update tokens, spacing, and component variants. No behavioural changes.",
+    "Tech-debt cleanup: {component} contains a deprecated helper that was supposed "
+    "to be removed last quarter. Replace call sites and delete.",
+    "Discovery: investigate whether {component} can be replaced with a managed "
+    "vendor solution. Produce a tradeoff doc and a rough cost estimate.",
+    "Observed in production: {component} is logging at DEBUG level by default. "
+    "Confirm the root cause, lower the verbosity, and add a regression test.",
+    "Compliance follow-up: {component} needs to support the new data-retention "
+    "policy. Add the cleanup job and verify with the audit team.",
+    "Pager fired last night on {component}. Suspected race condition on startup. "
+    "Capture the dump, add metrics, and write a postmortem entry.",
+    "Customer success requested an enhancement to {component} so account admins "
+    "can self-serve the most common configuration changes.",
+]
+ACCEPTANCE_CRITERIA = [
+    "Unit tests cover the new behaviour and existing regressions still pass.",
+    "Documentation is updated in the runbook.",
+    "A feature flag gates the rollout, defaulting to off.",
+    "Monitoring alerts are added before merging to main.",
+    "Reviewed and signed off by the security guild.",
+    "Performance budget unchanged on the homepage critical path.",
+    "Backfill script tested against the staging snapshot.",
+]
+EXTRA_LABEL_POOL = [
+    'frontend', 'backend', 'infra', 'security', 'perf',
+    'tech-debt', 'ux', 'data', 'platform', 'compliance', 'mobile',
+]
 
-def get_env_or_arg(env_name, arg_value, required=False):
-    value = arg_value if arg_value else os.environ.get(env_name)
-    if required and not value:
-        print(f"Error: {env_name} is required (or pass via CLI)")
-        sys.exit(1)
-    return value
+
+def generate_summary(rng):
+    parts = [rng.choice(ACTION_VERBS), rng.choice(COMPONENTS)]
+    if rng.random() < 0.4:
+        parts.append(rng.choice(QUALIFIERS))
+    return ' '.join(parts)
 
 
-def resolve_project_key(session, site, auth, project_input):
-    """Return a Jira project key for the given input (name or key)."""
-    url = f"https://{site}/rest/api/3/project/search"
-    params = {'query': project_input}
-    response = session.get(url, auth=auth, headers={'Accept': 'application/json'}, params=params)
-    if response.status_code != 200:
-        raise RuntimeError(f"Project search failed for '{project_input}': {response.status_code} {response.text}")
-
-    values = response.json().get('values', [])
-    target = project_input.strip().lower()
-
-    for project in values:
-        if project.get('key', '').lower() == target:
-            return project['key']
-    for project in values:
-        if project.get('name', '').lower() == target:
-            return project['key']
-
-    if len(values) == 1:
-        return values[0]['key']
-
-    if values:
-        options = ', '.join(f"{p.get('name')} ({p.get('key')})" for p in values)
-        raise RuntimeError(f"Ambiguous project '{project_input}'. Candidates: {options}")
-    raise RuntimeError(f"No Jira project found matching '{project_input}'.")
+def generate_description(rng):
+    template = rng.choice(DESCRIPTION_TEMPLATES)
+    paragraph = template.format(component=rng.choice(COMPONENTS))
+    criteria = rng.sample(ACCEPTANCE_CRITERIA, k=rng.randint(1, 3))
+    return paragraph, criteria
 
 
-def build_issue_payload(project_key, summary, description, issue_type, priority=None, labels=None):
+def generate_labels(rng):
+    base = ['auto-test', 'dashboard-sample']
+    extras = rng.sample(EXTRA_LABEL_POOL, k=rng.randint(0, 2))
+    return base + extras
+
+
+def build_adf_description(paragraph, criteria):
+    content = [
+        {
+            'type': 'paragraph',
+            'content': [{'type': 'text', 'text': paragraph}],
+        }
+    ]
+    if criteria:
+        content.append({
+            'type': 'paragraph',
+            'content': [{
+                'type': 'text',
+                'text': 'Acceptance criteria:',
+                'marks': [{'type': 'strong'}],
+            }],
+        })
+        content.append({
+            'type': 'bulletList',
+            'content': [
+                {
+                    'type': 'listItem',
+                    'content': [
+                        {'type': 'paragraph', 'content': [{'type': 'text', 'text': line}]}
+                    ],
+                }
+                for line in criteria
+            ],
+        })
+    return {'type': 'doc', 'version': 1, 'content': content}
+
+
+def build_issue_payload(project_key, summary, adf_description, issue_type, priority=None, labels=None):
     fields = {
         'project': {'key': project_key},
         'summary': summary,
-        'description': {
-            'type': 'doc',
-            'version': 1,
-            'content': [
-                {
-                    'type': 'paragraph',
-                    'content': [
-                        {'type': 'text', 'text': description}
-                    ]
-                }
-            ]
-        },
-        'issuetype': {'name': issue_type}
+        'description': adf_description,
+        'issuetype': {'name': issue_type},
     }
-
     if priority:
         fields['priority'] = {'name': priority}
-
     if labels:
         fields['labels'] = labels
-
     return {'fields': fields}
 
 
 def create_issue(session, site, auth, payload):
     url = f"https://{site}/rest/api/3/issue"
-    response = session.post(url, auth=auth, headers={'Content-Type': 'application/json'}, json=payload)
+    response = request_with_retry(
+        session, 'POST', url,
+        auth=auth,
+        headers={'Content-Type': 'application/json'},
+        json=payload,
+    )
     if response.status_code not in (200, 201):
-        raise RuntimeError(f"Failed to create issue: {response.status_code} {response.text}")
+        raise RuntimeError(f"Failed to create issue: {response.status_code} {truncate(response.text)}")
     return response.json()
 
 
 def create_issue_link(session, site, auth, link_type, inward_key, outward_key):
-    """Link two issues. For 'Blocks', outward = blocker, inward = blocked."""
     url = f"https://{site}/rest/api/3/issueLink"
     payload = {
         'type': {'name': link_type},
         'inwardIssue': {'key': inward_key},
         'outwardIssue': {'key': outward_key},
     }
-    response = session.post(url, auth=auth, headers={'Content-Type': 'application/json'}, json=payload)
+    response = request_with_retry(
+        session, 'POST', url,
+        auth=auth,
+        headers={'Content-Type': 'application/json'},
+        json=payload,
+    )
     if response.status_code not in (200, 201):
         raise RuntimeError(
             f"Failed to link {outward_key} -> {inward_key} ({link_type}): "
-            f"{response.status_code} {response.text}"
+            f"{response.status_code} {truncate(response.text)}"
         )
 
 
-def get_transitions(session, site, auth, issue_key):
-    url = f"https://{site}/rest/api/3/issue/{issue_key}/transitions"
-    response = session.get(url, auth=auth, headers={'Accept': 'application/json'})
-    if response.status_code != 200:
-        raise RuntimeError(f"Failed to fetch transitions for {issue_key}: {response.status_code} {response.text}")
-    return response.json().get('transitions', [])
+def create_issues_for_project(session, site, auth, project_key, count, issue_type_arg, dry_run, rng):
+    created = []
+    for i in range(1, count + 1):
+        summary = generate_summary(rng)
+        paragraph, criteria = generate_description(rng)
+        if issue_type_arg.lower() == 'random':
+            issue_type = rng.choice(SAFE_ISSUE_TYPES)
+        else:
+            issue_type = issue_type_arg
 
-
-def transition_issue(session, site, auth, issue_key, target_status_name):
-    """Move issue to the given target status (case-insensitive match on destination status, then transition name)."""
-    transitions = get_transitions(session, site, auth, issue_key)
-    target = target_status_name.strip().lower()
-
-    chosen = None
-    for t in transitions:
-        if t.get('to', {}).get('name', '').lower() == target:
-            chosen = t
-            break
-    if not chosen:
-        for t in transitions:
-            if t.get('name', '').lower() == target:
-                chosen = t
-                break
-    if not chosen:
-        available = ', '.join(f"{t.get('name')}->{t.get('to', {}).get('name')}" for t in transitions)
-        raise RuntimeError(f"No transition to '{target_status_name}' for {issue_key}. Available: {available}")
-
-    url = f"https://{site}/rest/api/3/issue/{issue_key}/transitions"
-    response = session.post(
-        url,
-        auth=auth,
-        headers={'Content-Type': 'application/json'},
-        json={'transition': {'id': chosen['id']}},
-    )
-    if response.status_code not in (200, 204):
-        raise RuntimeError(
-            f"Failed to transition {issue_key} to '{target_status_name}': "
-            f"{response.status_code} {response.text}"
+        payload = build_issue_payload(
+            project_key=project_key,
+            summary=f"[{project_key}] {summary}",
+            adf_description=build_adf_description(paragraph, criteria),
+            issue_type=issue_type,
+            priority=rng.choice(PRIORITIES),
+            labels=generate_labels(rng),
         )
 
+        if dry_run:
+            print(json.dumps(payload, indent=2))
+            continue
 
-def randomize_statuses(session, site, auth, totals, dry_run, seed=None,
-                       in_progress_pct=0.20, done_pct=0.15):
-    if dry_run:
-        print("\nSkipping status transitions (dry-run).")
-        return
-
-    all_keys = [k for keys in totals.values() for k in keys if k]
-    if not all_keys:
-        return
-
-    rng = random.Random(seed)
-    shuffled = all_keys[:]
-    rng.shuffle(shuffled)
-
-    n = len(shuffled)
-    n_in_progress = int(round(n * in_progress_pct))
-    n_done = int(round(n * done_pct))
-    in_progress_keys = shuffled[:n_in_progress]
-    done_keys = shuffled[n_in_progress:n_in_progress + n_done]
-
-    print(f"\nTransitioning {len(in_progress_keys)} issues ({in_progress_pct:.0%}) to 'In Progress'...")
-    for key in in_progress_keys:
         try:
-            transition_issue(session, site, auth, key, 'In Progress')
-            print(f"  {key} -> In Progress")
+            result = create_issue(session, site, auth, payload)
+            issue_key = result.get('key')
+            created.append(issue_key)
+            print(f"  Created {issue_key}: {summary}")
         except Exception as exc:
-            print(f"  transition error: {exc}")
+            print(f"  Error creating issue #{i} in {project_key}: {exc}")
+            continue
 
-    print(f"\nTransitioning {len(done_keys)} issues ({done_pct:.0%}) to 'Done'...")
-    for key in done_keys:
-        try:
-            transition_issue(session, site, auth, key, 'Done')
-            print(f"  {key} -> Done")
-        except Exception:
-            try:
-                transition_issue(session, site, auth, key, 'In Progress')
-                transition_issue(session, site, auth, key, 'Done')
-                print(f"  {key} -> In Progress -> Done")
-            except Exception as exc2:
-                print(f"  transition error: {exc2}")
+    return created
 
 
-def create_relationships(session, site, auth, totals, dry_run, seed=None):
-    """Create one-to-many, many-to-many, and many-to-one issue links across the created issues."""
+def create_relationships(session, site, auth, totals, dry_run, rng):
     if dry_run:
         print("\nSkipping issue links (dry-run).")
         return
@@ -216,7 +235,6 @@ def create_relationships(session, site, auth, totals, dry_run, seed=None):
         print("\nNot enough issues to create relationships.")
         return
 
-    rng = random.Random(seed)
     links_made = 0
 
     print("\nCreating one-to-many links (parent 'Blocks' 5 children, per project)...")
@@ -232,7 +250,7 @@ def create_relationships(session, site, auth, totals, dry_run, seed=None):
             except Exception as exc:
                 print(f"  link error: {exc}")
 
-    print("\nCreating many-to-many links (20 random cross-project 'Relates' pairs)...")
+    print("\nCreating many-to-many links (20 random 'Relates' pairs)...")
     pairs_target = min(20, len(all_keys) // 2)
     seen_pairs = set()
     attempts = 0
@@ -266,72 +284,82 @@ def create_relationships(session, site, auth, totals, dry_run, seed=None):
     print(f"\nCreated {links_made} issue links.")
 
 
-def create_issues_for_project(session, site, auth, project_key, count, issue_type, dry_run):
-    created = []
-    for i in range(1, count + 1):
-        summary = f"[{project_key}] Auto-generated test issue #{i}"
-        description = (
-            "This is a test issue created by create_jira_test_issues.py for dashboard validation. "
-            "Use this issue to verify that Jira project page data is visible in your Forge app."
-        )
-        payload = build_issue_payload(
-            project_key=project_key,
-            summary=summary,
-            description=description,
-            issue_type=issue_type if issue_type else random.choice(ISSUE_TYPES),
-            priority=random.choice(PRIORITIES),
-            labels=['auto-test', 'dashboard-sample']
-        )
+def randomize_statuses(session, site, auth, totals, dry_run, rng, in_progress_pct, done_pct):
+    if dry_run:
+        print("\nSkipping status transitions (dry-run).")
+        return
 
-        if dry_run:
-            print(json.dumps(payload, indent=2))
-            continue
+    all_keys = [k for keys in totals.values() for k in keys if k]
+    if not all_keys:
+        return
 
+    shuffled = all_keys[:]
+    rng.shuffle(shuffled)
+    n = len(shuffled)
+    n_in_progress = int(round(n * in_progress_pct))
+    n_done = int(round(n * done_pct))
+    in_progress_keys = shuffled[:n_in_progress]
+    done_keys = shuffled[n_in_progress:n_in_progress + n_done]
+
+    print(f"\nTransitioning {len(in_progress_keys)} issues ({in_progress_pct:.0%}) to 'In Progress'...")
+    for key in in_progress_keys:
         try:
-            result = create_issue(session, site, auth, payload)
-            issue_key = result.get('key')
-            created.append(issue_key)
-            print(f"  Created {issue_key}")
+            transition_issue(session, site, auth, key, 'In Progress')
+            print(f"  {key} -> In Progress")
         except Exception as exc:
-            print(f"  Error creating issue #{i} in {project_key}: {exc}")
-            break
+            print(f"  transition error: {exc}")
 
-    return created
+    print(f"\nTransitioning {len(done_keys)} issues ({done_pct:.0%}) to 'Done'...")
+    for key in done_keys:
+        try:
+            transition_issue(session, site, auth, key, 'Done')
+            print(f"  {key} -> Done")
+        except Exception as first:
+            try:
+                transition_issue(session, site, auth, key, 'In Progress')
+                transition_issue(session, site, auth, key, 'Done')
+                print(f"  {key} -> In Progress -> Done")
+            except Exception as second:
+                print(f"  transition error: {second} (direct: {first})")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Create test Jira issues for dashboard testing.')
+    parser = argparse.ArgumentParser(description='Create realistic test Jira issues with links and statuses.')
     parser.add_argument('--site', help='Jira site hostname, e.g. shivammokha94.atlassian.net')
     parser.add_argument('--user', help='Atlassian account email')
-    parser.add_argument('--token', help='Atlassian API token')
     parser.add_argument(
-        '--projects',
-        nargs='+',
-        default=DEFAULT_PROJECTS,
-        help='Jira project names or keys (space-separated). Defaults to the 4 standard test projects.',
+        '--projects', nargs='+', default=DEFAULT_PROJECTS,
+        help='Project names or keys. Defaults to the 4 standard test projects.',
     )
-    parser.add_argument('--count', type=int, default=50, help='Number of issues to create per project')
-    parser.add_argument('--issuetype', default='Task', help='Jira issue type to use')
-    parser.add_argument('--dry-run', action='store_true', help='Show issue payloads without creating them')
-    parser.add_argument('--no-links', action='store_true', help='Skip creating issue link relationships')
+    parser.add_argument('--count', type=int, default=50, help='Issues to create per project')
+    parser.add_argument('--issuetype', default='Task',
+                        help='Issue type name, or "random" to randomize among Task/Story/Bug')
+    parser.add_argument('--no-links', action='store_true', help='Skip issue link creation')
     parser.add_argument('--no-transitions', action='store_true', help='Skip randomized status transitions')
-    parser.add_argument('--in-progress-pct', type=float, default=0.20, help='Fraction of issues to move to In Progress')
-    parser.add_argument('--done-pct', type=float, default=0.15, help='Fraction of issues to move to Done')
-    parser.add_argument('--seed', type=int, default=None, help='Random seed for reproducible link pairs / status picks')
+    parser.add_argument('--in-progress-pct', type=float, default=0.20,
+                        help='Fraction of created issues to move to In Progress')
+    parser.add_argument('--done-pct', type=float, default=0.15,
+                        help='Fraction of created issues to move to Done')
+    parser.add_argument('--seed', type=int, default=None, help='Random seed for reproducibility')
+    parser.add_argument('--dry-run', action='store_true', help='Show payloads without creating anything')
+    parser.add_argument('--yes', action='store_true', help='Skip the confirmation prompt')
     args = parser.parse_args()
 
-    site = get_env_or_arg('JIRA_SITE', args.site, required=True)
+    if not (0.0 <= args.in_progress_pct <= 1.0 and 0.0 <= args.done_pct <= 1.0):
+        parser.error("--in-progress-pct and --done-pct must be between 0 and 1")
+    if args.in_progress_pct + args.done_pct > 1.0:
+        parser.error("--in-progress-pct + --done-pct must sum to <= 1.0")
+
+    site = validate_site(get_env_or_arg('JIRA_SITE', args.site, required=True))
     user = get_env_or_arg('JIRA_USER', args.user, required=True)
-    token = get_env_or_arg('JIRA_API_TOKEN', args.token, required=True)
-    count_env = os.environ.get('ISSUE_COUNT')
+    token = get_env_or_arg('JIRA_API_TOKEN', None, required=True)
+
+    count_env = get_env_or_arg('ISSUE_COUNT', None)
     count = int(count_env) if count_env else args.count
-    issue_type = args.issuetype
 
-    if issue_type not in ISSUE_TYPES:
-        print(f"Warning: '{issue_type}' is not in the standard issue type list. Proceeding anyway.")
-
-    session = requests.Session()
+    session = build_session()
     auth = (user, token)
+    rng = random.Random(args.seed)
 
     resolved = []
     for project_input in args.projects:
@@ -346,21 +374,26 @@ def main():
         print("No projects could be resolved. Exiting.")
         sys.exit(1)
 
+    print(f"\nPlanned: create {count} issues in each of {len(resolved)} project(s) on {site}.")
+    if not args.dry_run and not args.yes:
+        confirm_or_exit("Proceed?")
+
     totals = {}
     for project_input, key in resolved:
-        print(f"\nCreating {count} issues in {project_input} ({key}) on {site}")
-        created = create_issues_for_project(session, site, auth, key, count, issue_type, args.dry_run)
+        print(f"\nCreating {count} issues in {project_input} ({key})")
+        created = create_issues_for_project(
+            session, site, auth, key, count,
+            args.issuetype, args.dry_run, rng,
+        )
         totals[key] = created
 
     if not args.no_links:
-        create_relationships(session, site, auth, totals, args.dry_run, seed=args.seed)
+        create_relationships(session, site, auth, totals, args.dry_run, rng)
 
     if not args.no_transitions:
         randomize_statuses(
-            session, site, auth, totals, args.dry_run,
-            seed=args.seed,
-            in_progress_pct=args.in_progress_pct,
-            done_pct=args.done_pct,
+            session, site, auth, totals, args.dry_run, rng,
+            args.in_progress_pct, args.done_pct,
         )
 
     if not args.dry_run:

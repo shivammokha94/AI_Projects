@@ -1,70 +1,37 @@
 #!/usr/bin/env python3
 """Randomize statuses of EXISTING Jira issues across one or more projects.
 
-Moves 20% of all issues to 'In Progress' and 15% to 'Done' (random, disjoint sets).
-The remaining ~65% are left untouched.
-
-Usage:
+Auth (env var only, kept out of shell history and ps output):
   export JIRA_API_TOKEN='...'
   python3 randomize_jira_statuses.py \
     --site shivammokha94.atlassian.net \
-    --user your-email@example.com
+    --user you@example.com
 
-By default operates on: Delivery, Feature Tracking, Change Request, Product Delivery.
-Override with --projects (names or keys).
+Moves 20% of all issues to 'In Progress' and 15% to 'Done' (random, disjoint sets).
+The remaining ~65% are left untouched.
 """
 
 import argparse
-import os
 import random
 import sys
 
-try:
-    import requests
-except ImportError:
-    print("The 'requests' package is required. Install it with: pip install requests")
-    sys.exit(1)
+from jira_common import (
+    build_session,
+    confirm_or_exit,
+    get_env_or_arg,
+    request_with_retry,
+    resolve_project_key,
+    transition_issue,
+    truncate,
+    validate_site,
+)
+
 
 DEFAULT_PROJECTS = ['Delivery', 'Feature Tracking', 'Change Request', 'Product Delivery']
 
 
-def get_env_or_arg(env_name, arg_value, required=False):
-    value = arg_value if arg_value else os.environ.get(env_name)
-    if required and not value:
-        print(f"Error: {env_name} is required (or pass via CLI)")
-        sys.exit(1)
-    return value
-
-
-def resolve_project_key(session, site, auth, project_input):
-    """Return the Jira project key matching a name or key."""
-    url = f"https://{site}/rest/api/3/project/search"
-    response = session.get(
-        url, auth=auth,
-        headers={'Accept': 'application/json'},
-        params={'query': project_input},
-    )
-    if response.status_code != 200:
-        raise RuntimeError(f"Project search failed for '{project_input}': {response.status_code} {response.text}")
-
-    values = response.json().get('values', [])
-    target = project_input.strip().lower()
-    for project in values:
-        if project.get('key', '').lower() == target:
-            return project['key']
-    for project in values:
-        if project.get('name', '').lower() == target:
-            return project['key']
-    if len(values) == 1:
-        return values[0]['key']
-    if values:
-        options = ', '.join(f"{p.get('name')} ({p.get('key')})" for p in values)
-        raise RuntimeError(f"Ambiguous project '{project_input}'. Candidates: {options}")
-    raise RuntimeError(f"No Jira project found matching '{project_input}'.")
-
-
 def fetch_all_issues(session, site, auth, project_key):
-    """Yield (issue_key, status_name) for every issue in a project via the enhanced JQL search API."""
+    """Yield (issue_key, status_name) for every issue in a project via enhanced JQL search."""
     url = f"https://{site}/rest/api/3/search/jql"
     next_page_token = None
     while True:
@@ -76,69 +43,34 @@ def fetch_all_issues(session, site, auth, project_key):
         if next_page_token:
             payload['nextPageToken'] = next_page_token
 
-        response = session.post(
-            url, auth=auth,
+        response = request_with_retry(
+            session, 'POST', url,
+            auth=auth,
             headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
             json=payload,
         )
         if response.status_code != 200:
-            raise RuntimeError(f"Search failed for {project_key}: {response.status_code} {response.text}")
+            raise RuntimeError(
+                f"Search failed for {project_key}: {response.status_code} {truncate(response.text)}"
+            )
 
         data = response.json()
         for issue in data.get('issues', []):
+            key = issue.get('key')
+            if not key:
+                continue
             status_name = issue.get('fields', {}).get('status', {}).get('name', '')
-            yield issue['key'], status_name
+            yield key, status_name
 
         next_page_token = data.get('nextPageToken')
         if data.get('isLast') or not next_page_token:
             break
 
 
-def get_transitions(session, site, auth, issue_key):
-    url = f"https://{site}/rest/api/3/issue/{issue_key}/transitions"
-    response = session.get(url, auth=auth, headers={'Accept': 'application/json'})
-    if response.status_code != 200:
-        raise RuntimeError(f"Failed to fetch transitions for {issue_key}: {response.status_code} {response.text}")
-    return response.json().get('transitions', [])
-
-
-def transition_issue(session, site, auth, issue_key, target_status_name):
-    """Match by destination status first, then transition name (case-insensitive)."""
-    transitions = get_transitions(session, site, auth, issue_key)
-    target = target_status_name.strip().lower()
-
-    chosen = None
-    for t in transitions:
-        if t.get('to', {}).get('name', '').lower() == target:
-            chosen = t
-            break
-    if not chosen:
-        for t in transitions:
-            if t.get('name', '').lower() == target:
-                chosen = t
-                break
-    if not chosen:
-        available = ', '.join(f"{t.get('name')}->{t.get('to', {}).get('name')}" for t in transitions)
-        raise RuntimeError(f"No transition to '{target_status_name}' for {issue_key}. Available: {available}")
-
-    url = f"https://{site}/rest/api/3/issue/{issue_key}/transitions"
-    response = session.post(
-        url, auth=auth,
-        headers={'Content-Type': 'application/json'},
-        json={'transition': {'id': chosen['id']}},
-    )
-    if response.status_code not in (200, 204):
-        raise RuntimeError(
-            f"Failed to transition {issue_key} to '{target_status_name}': "
-            f"{response.status_code} {response.text}"
-        )
-
-
 def main():
     parser = argparse.ArgumentParser(description='Randomize statuses for existing Jira issues.')
     parser.add_argument('--site', help='Jira site hostname, e.g. shivammokha94.atlassian.net')
     parser.add_argument('--user', help='Atlassian account email')
-    parser.add_argument('--token', help='Atlassian API token')
     parser.add_argument(
         '--projects', nargs='+', default=DEFAULT_PROJECTS,
         help='Project names or keys. Defaults to the 4 standard test projects.',
@@ -149,13 +81,19 @@ def main():
                         help='Fraction of all issues to move to Done')
     parser.add_argument('--seed', type=int, default=None, help='Random seed for reproducibility')
     parser.add_argument('--dry-run', action='store_true', help='Show targets without applying transitions')
+    parser.add_argument('--yes', action='store_true', help='Skip the confirmation prompt')
     args = parser.parse_args()
 
-    site = get_env_or_arg('JIRA_SITE', args.site, required=True)
-    user = get_env_or_arg('JIRA_USER', args.user, required=True)
-    token = get_env_or_arg('JIRA_API_TOKEN', args.token, required=True)
+    if not (0.0 <= args.in_progress_pct <= 1.0 and 0.0 <= args.done_pct <= 1.0):
+        parser.error("--in-progress-pct and --done-pct must be between 0 and 1")
+    if args.in_progress_pct + args.done_pct > 1.0:
+        parser.error("--in-progress-pct + --done-pct must sum to <= 1.0")
 
-    session = requests.Session()
+    site = validate_site(get_env_or_arg('JIRA_SITE', args.site, required=True))
+    user = get_env_or_arg('JIRA_USER', args.user, required=True)
+    token = get_env_or_arg('JIRA_API_TOKEN', None, required=True)
+
+    session = build_session()
     auth = (user, token)
 
     project_keys = []
@@ -205,6 +143,9 @@ def main():
             print(f"  {key} (currently {status})")
         return
 
+    if not args.yes:
+        confirm_or_exit("This will modify the issues listed above. Proceed?")
+
     print("\nTransitioning to In Progress...")
     in_progress_ok = 0
     for key, status in in_progress_targets:
@@ -230,14 +171,14 @@ def main():
             transition_issue(session, site, auth, key, 'Done')
             done_ok += 1
             print(f"  {key} -> Done (was {status})")
-        except Exception:
+        except Exception as first:
             try:
                 transition_issue(session, site, auth, key, 'In Progress')
                 transition_issue(session, site, auth, key, 'Done')
                 done_ok += 1
                 print(f"  {key} -> In Progress -> Done (was {status})")
-            except Exception as exc2:
-                print(f"  {key} error: {exc2}")
+            except Exception as second:
+                print(f"  {key} error: {second} (direct: {first})")
 
     print(f"\nSummary: {in_progress_ok}/{n_in_progress} In Progress, {done_ok}/{n_done} Done")
 
